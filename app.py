@@ -9,7 +9,7 @@ import pandas as pd                        # Manipulation des donnees tabulaires
 import numpy as np                         # Calcul numerique / generation de bruit aleatoire
 import plotly.express as px                # Graphiques rapides (histogrammes, barres)
 import plotly.graph_objects as go          # Graphiques avances (courbes, ROC, prevision)
-from supabase import create_client, Client # Connexion a la base de donnees Cloud (remplace sqlite3)
+import sqlite3                             # Connexion a la base de donnees locale
 import time                                # Gestion des pauses pour le rafraichissement auto
 from datetime import datetime              # Horodatage des rapports PDF
 from PIL import Image                      # Chargement du logo de l'entreprise
@@ -169,9 +169,103 @@ st.markdown("""
         .icon-alerte  { color: #C8294E; margin-right: 6px; }   /* Icone rouge : fuite */
         .icon-stable  { color: #007858; margin-right: 6px; }   /* Icone verte : etat stable */
         .icon-lien    { margin-right: 6px; }                   /* Icone du bouton Google Maps */
+
+        /* --- PAGE DE CONNEXION --- */
+        .login-titre { text-align:center; margin-top: 40px; }
+        .login-souscritre { text-align:center; color:#4A8FA8; margin-bottom: 30px; }
     </style>
 """, unsafe_allow_html=True)
 
+
+# ==============================================================================
+# AUTHENTIFICATION (ACCES RESERVE AUX ADMINISTRATEURS)
+# ==============================================================================
+# L'application etant destinee a etre hebergee publiquement (Streamlit Community
+# Cloud), elle ne doit PAS etre consultable par n'importe qui. Il n'y a AUCUN
+# formulaire d'inscription : seuls des comptes admin crees a l'avance (par toi,
+# directement dans les secrets de l'application) peuvent se connecter.
+#
+# Les identifiants sont stockes dans st.secrets, jamais dans le code source.
+# Cree un fichier .streamlit/secrets.toml (en local, NE JAMAIS le versionner
+# dans Git) avec la structure suivante :
+#
+#   [admins]
+#   jonathan = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d"
+#
+# La valeur n'est PAS le mot de passe en clair, mais son empreinte SHA-256.
+# Pour generer cette empreinte a partir d'un mot de passe choisi, execute :
+#   python3 -c "import hashlib; print(hashlib.sha256('MonMotDePasse'.encode()).hexdigest())"
+#
+# Une fois deploye sur Streamlit Community Cloud, la meme structure se
+# configure depuis l'interface "Secrets" du tableau de bord de l'application
+# (Settings > Secrets), sans jamais toucher au code.
+#
+# NOTE D'EVOLUTION : cette fonction de verification est volontairement isolee.
+# Le jour ou la base de donnees migrera vers Supabase, il suffira de remplacer
+# son contenu par un appel a Supabase Auth (supabase.auth.sign_in_with_password)
+# sans modifier le reste de l'application.
+# ==============================================================================
+
+def verifier_identifiants(nom_utilisateur: str, mot_de_passe: str) -> bool:
+    """
+    Verifie un couple nom d'utilisateur / mot de passe par rapport aux
+    comptes admin declares dans st.secrets. Retourne True si l'authentification
+    reussit, False sinon. Le mot de passe n'est jamais compare en clair : on
+    compare son empreinte SHA-256 a celle enregistree dans les secrets.
+    """
+    admins = st.secrets.get("admins", {})
+    if nom_utilisateur not in admins:
+        return False
+    empreinte_saisie = hashlib.sha256(mot_de_passe.encode()).hexdigest()
+    empreinte_attendue = admins[nom_utilisateur]
+    return empreinte_saisie == empreinte_attendue
+
+
+def afficher_page_connexion():
+    """
+    Affiche un formulaire de connexion centre, dans le meme theme visuel
+    (navy/aqua) que le reste de l'application. Tant que l'authentification
+    n'a pas reussi, aucune autre partie de l'application (sidebar, donnees,
+    cartographie...) n'est chargee ni affichee.
+    """
+    col_gauche, col_centre, col_droite = st.columns([1, 1.2, 1])
+    with col_centre:
+        st.markdown(
+            "<h2 class='login-titre'> REGIDESO S.A.</h2>",
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            "<p class='login-souscritre'>Acces reserve aux administrateurs du systeme</p>",
+            unsafe_allow_html=True
+        )
+
+        with st.form("formulaire_connexion", clear_on_submit=False):
+            nom_utilisateur = st.text_input("Identifiant")
+            mot_de_passe = st.text_input("Mot de passe", type="password")
+            connexion_soumise = st.form_submit_button(
+                ":material/login: Se connecter", use_container_width=True
+            )
+
+        if connexion_soumise:
+            if verifier_identifiants(nom_utilisateur, mot_de_passe):
+                st.session_state["authentifie"] = True
+                st.session_state["utilisateur_connecte"] = nom_utilisateur
+                st.rerun()
+            else:
+                st.error(":material/error: Identifiant ou mot de passe incorrect.")
+
+
+# Initialisation de l'etat de connexion (une seule fois par session utilisateur)
+if "authentifie" not in st.session_state:
+    st.session_state["authentifie"] = False
+
+# GARDE D'ACCES : tant que l'utilisateur n'est pas authentifie, on affiche
+# uniquement la page de connexion et on arrete completement l'execution du
+# script ici. Aucune donnee, aucune sidebar, aucun tableau de bord n'est
+# charge ou expose a un visiteur non authentifie.
+if not st.session_state["authentifie"]:
+    afficher_page_connexion()
+    st.stop()
 
 # ==============================================================================
 # COORDONNEES GEOGRAPHIQUES DE REFERENCE PAR COMMUNE (CENTRE APPROXIMATIF)
@@ -189,64 +283,27 @@ COORDS_COMMUNES = {
 
 
 # ==============================================================================
-# CONNEXION SUPABASE (REMPLACE LA CONNEXION SQLITE)
+# CHARGEMENT DES DONNEES DEPUIS LA BASE SQLITE
 # ==============================================================================
-# Table equivalente a l'ancienne table SQLite "mesures_comparatives"
-TABLE_MESURES = "mesures_comparatives"
-# Table equivalente a l'ancienne table SQLite "topologie_secteurs"
-TABLE_TOPOLOGIE = "topologie_secteurs"
+DB_NAME = "regideso_comparatif.db"   # Nom du fichier de base de donnees local
 
-
-@st.cache_resource(show_spinner=False)
-def init_connection() -> Client:
-    """
-    Cree une connexion unique et reutilisable au projet Supabase, a partir des
-    identifiants stockes dans les secrets Streamlit (fichier .streamlit/secrets.toml
-    en local, ou onglet "Secrets" dans les parametres de l'application sur
-    Streamlit Community Cloud) :
-
-        SUPABASE_URL = "https://xxxxxxxx.supabase.co"
-        SUPABASE_KEY = "xxxxxxxx"
-
-    Mise en cache via st.cache_resource : le client n'est instancie qu'une seule
-    fois pour toute la duree de vie du serveur, meme si charger_donnees() est
-    appelee a chaque rafraichissement.
-    """
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
-
-
-# ==============================================================================
-# CHARGEMENT DES DONNEES DEPUIS SUPABASE (REMPLACE LA LECTURE SQLITE)
-# ==============================================================================
 def charger_donnees():
     """
-    Recupere les deux tables necessaires depuis Supabase :
+    Se connecte a la base SQLite et recupere les deux tables necessaires :
     - mesures_comparatives : les mesures de debit/pression/alertes par commune
     - topologie_secteurs   : les informations structurelles du reseau
-    Retourne deux DataFrames vides en cas d'echec (secrets manquants, table
-    inexistante, projet Supabase injoignable, etc.), pour ne pas faire planter
-    le reste de l'application.
+    Retourne deux DataFrames vides en cas d'echec (base absente, table manquante, etc.).
     """
     try:
-        supabase = init_connection()
-
-        reponse_mesures = supabase.table(TABLE_MESURES).select("*").order("timestamp", desc=False).execute()
-        reponse_topo = supabase.table(TABLE_TOPOLOGIE).select("*").order("timestamp", desc=False).execute()
-
-        df_sql = pd.DataFrame(reponse_mesures.data)
-        df_topo = pd.DataFrame(reponse_topo.data)
-
-        if df_sql.empty or df_topo.empty:
-            return pd.DataFrame(), pd.DataFrame()
-
+        conn = sqlite3.connect(DB_NAME)                                      # Ouverture de la connexion
+        df_sql = pd.read_sql_query("SELECT * FROM mesures_comparatives", conn)   # Lecture des mesures
+        df_topo = pd.read_sql_query("SELECT * FROM topologie_secteurs", conn)    # Lecture de la topologie
+        conn.close()                                                         # Fermeture propre de la connexion
         df_sql['timestamp'] = pd.to_datetime(df_sql['timestamp'])            # Conversion en type date/heure
         df_topo['timestamp'] = pd.to_datetime(df_topo['timestamp'])          # Idem pour la topologie
         return df_sql, df_topo
     except Exception:
-        # En cas d'erreur (secrets absents, table inexistante, reseau indisponible...)
-        # on retourne des DataFrames vides plutot que de faire planter l'app.
+        # En cas d'erreur (base absente, table inexistante...) on retourne des DataFrames vides
         return pd.DataFrame(), pd.DataFrame()
 
 # Chargement effectif des donnees au demarrage du script
@@ -534,6 +591,17 @@ with st.sidebar:
         )
     except Exception as e:
         st.error(f"Erreur PDF : {e}")
+
+    # --- Bloc 5 : identite de l'admin connecte + deconnexion ---
+    st.markdown(
+        "<div style='border-top:1px solid rgba(0,200,230,0.1); margin-top:15px; margin-bottom:15px;'></div>",
+        unsafe_allow_html=True
+    )
+    st.caption(f":material/person: Connecté en tant que **{st.session_state.get('utilisateur_connecte', '')}**")
+    if st.button(":material/logout: Se déconnecter", use_container_width=True, key="btn_deconnexion"):
+        st.session_state["authentifie"] = False
+        st.session_state.pop("utilisateur_connecte", None)
+        st.rerun()
 
 
 # ==============================================================================
